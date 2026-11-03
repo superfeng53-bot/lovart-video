@@ -1,0 +1,11 @@
+{
+  "active_index": 0,
+  "accounts": [
+    {
+      "id": "main",
+      "access_key": "ak_xxx",
+      "secret_key": "sk_xxx",
+      "note": "把 ak_xxx / sk_xxx 换成你自己的 Lovart AK/SK。有 .env 时优先用 .env，除非命令加 --account"
+    }
+  ]
+}
