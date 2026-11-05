@@ -3,6 +3,13 @@
 
 账号只从本目录 .env 或 accounts.json 读取，不写进命令历史以外的仓库文件。
 首次运行会把官方客户端克隆到 vendor/（不提交）。
+
+默认最佳实践（可显式关掉）：
+- 账号设为 fast（扣积分、不排队）
+- Agent 推理 --mode fast
+- Seedance 2.5 / 1080p / 9:16
+- 提示词强制「只要视频、必须有音轨」
+- 落盘后用 ffprobe 验收是否有音轨
 """
 
 from __future__ import annotations
@@ -14,7 +21,7 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
+time = __import__("time")
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +42,14 @@ MODELS = {
     "seedance2.0-fast": "generate_video_seedance_v2_0_fast",
     "mini": "generate_video_seedance_v2_0_mini",
 }
+MODEL_LABELS = {
+    "seedance2.5": "Seedance 2.5",
+    "seedance2.0": "Seedance 2.0",
+    "seedance2.0-fast": "Seedance 2.0 Fast",
+    "mini": "Seedance 2.0 Mini",
+}
+DEFAULT_RESOLUTION = "1080p"
+DEFAULT_ASPECT = "9:16"
 
 
 def die(message: str, code: int = 1) -> None:
@@ -125,7 +140,7 @@ def parse_json(text: str) -> dict:
     return obj
 
 
-def run_cli(cli: Path, args: list[str], *, heartbeat: str = "") -> dict:
+def run_cli(cli: Path, args: list[str], *, heartbeat: str = "", allow_fail: bool = False) -> dict:
     cmd = [sys.executable, str(cli), *args]
     stop = threading.Event()
 
@@ -146,10 +161,31 @@ def run_cli(cli: Path, args: list[str], *, heartbeat: str = "") -> dict:
     if proc.stderr.strip():
         print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
     if proc.returncode != 0:
+        if allow_fail:
+            return {"ok": False, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
         if proc.stdout.strip():
             print(proc.stdout, file=sys.stderr)
         raise SystemExit(proc.returncode)
+    if not proc.stdout.strip():
+        return {"ok": True}
     return parse_json(proc.stdout)
+
+
+def ensure_account_fast(cli: Path, *, force: bool) -> None:
+    """把账号切到 fast（扣积分、不排队）。封面生图才用 unlimited。"""
+    if not force:
+        return
+    print("账号模式：set-mode --fast（扣积分、不排队）", flush=True)
+    payload = run_cli(cli, ["set-mode", "--fast"], allow_fail=True)
+    if payload.get("ok") is False:
+        print(
+            "警告：set-mode --fast 失败，仍会用 --mode fast 提交。"
+            "请手动执行：python3 generate_video.py set-fast",
+            file=sys.stderr,
+        )
+        return
+    if payload and payload.get("ok") is not False:
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def save_last(out_dir: Path, payload: dict) -> None:
@@ -169,7 +205,64 @@ def local_files(payload: dict) -> list[str]:
     return found
 
 
-def report(payload: dict, out_dir: Path) -> None:
+def has_audio_stream(path: str) -> bool | None:
+    """True=有音轨，False=无音轨，None=无法检测。"""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return "audio" in (proc.stdout or "").lower()
+
+
+def verify_videos(payload: dict, *, require_audio: bool, allow_silent: bool) -> None:
+    files = local_files(payload)
+    videos = [path for path in files if path.lower().endswith((".mp4", ".mov", ".webm"))]
+    if not videos:
+        return
+    missing = []
+    unknown = []
+    for path in videos:
+        result = has_audio_stream(path)
+        if result is True:
+            print(f"音轨验收：{path} → 有音轨", flush=True)
+        elif result is False:
+            print(f"音轨验收：{path} → 无音轨", flush=True)
+            missing.append(path)
+        else:
+            print(f"音轨验收：{path} → 未安装 ffprobe，跳过检测", flush=True)
+            unknown.append(path)
+    if missing and require_audio and not allow_silent:
+        die(
+            "落盘视频没有音轨。这通常是因为提示词没写「有声=…」。\n"
+            "不要立刻重新提交同一条（会再扣费）。先看 GOTCHAS.md，确认提示词后再开新任务。\n"
+            "若你本来就要无声片：加 --silent 或 --allow-silent-output。\n"
+            "无声文件：\n  - " + "\n  - ".join(missing),
+            code=4,
+        )
+
+
+def report(payload: dict, out_dir: Path, *, require_audio: bool = True, allow_silent: bool = False) -> None:
     save_last(out_dir, payload)
     status = payload.get("final_status") or payload.get("status") or ""
     thread_id = payload.get("thread_id") or ""
@@ -189,6 +282,8 @@ def report(payload: dict, out_dir: Path) -> None:
     if status == "done" and not videos:
         print("这次没有下载到视频文件。请看上面的返回；若只有图片，改提示词明确只要视频。")
     print(f"记录: {out_dir / 'last-run.json'}")
+    if status in {"done", ""} or videos:
+        verify_videos(payload, require_audio=require_audio, allow_silent=allow_silent)
 
 
 def cost_text(pending: dict) -> str:
@@ -200,6 +295,20 @@ def cost_text(pending: dict) -> str:
     return "返回里没有单独的预估积分字段，完整确认信息如下。"
 
 
+def model_label(args: argparse.Namespace) -> str:
+    if args.tool:
+        return args.tool
+    return MODEL_LABELS.get(args.model, args.model)
+
+
+def audio_spec(args: argparse.Namespace) -> str:
+    if args.silent:
+        return ""
+    if args.spoken:
+        return "有声=必须带口播人声音轨（开口同步出声，禁止只出无声画面）"
+    return "有声=必须带可听见的音轨（环境声/动作声/人声均可，禁止只出无声画面）"
+
+
 def build_prompt(args: argparse.Namespace) -> str:
     if args.prompt_file:
         prompt = Path(args.prompt_file).read_text(encoding="utf-8").strip()
@@ -207,19 +316,30 @@ def build_prompt(args: argparse.Namespace) -> str:
         prompt = (args.prompt or "").strip()
     if not prompt:
         die("请用 --prompt 或 --prompt-file 提供提示词。")
-    specs = []
-    if args.resolution:
-        specs.append(args.resolution)
-    if args.aspect:
-        specs.append(args.aspect)
+
+    resolution = args.resolution or DEFAULT_RESOLUTION
+    aspect = args.aspect or DEFAULT_ASPECT
+    specs = [resolution, aspect]
     if args.seconds:
         specs.append(f"时长 {args.seconds} 秒")
-    if specs:
-        prompt = prompt.rstrip() + "\n规格：" + "，".join(specs) + "。"
+    audio = audio_spec(args)
+    if audio:
+        specs.append(audio)
+
     if not args.no_direct:
-        prompt = (
-            "直接生成视频，不要先出分镜、规划图或静图，只出视频文件。\n" + prompt
+        kind = "口播视频" if args.spoken else "视频"
+        label = model_label(args)
+        prefix = (
+            f"用 {label} 直接生成一条{kind}，规格："
+            + "，".join(specs)
+            + "。严格按下面提示词执行"
+            + ("，一字不改台词" if args.spoken else "")
+            + "。禁止先生成分镜图、规划图、首帧图或任何静图；"
+            "禁止视觉规划子代理；只调用视频工具出视频，不要先出图。\n"
         )
+        prompt = prefix + prompt
+    else:
+        prompt = prompt.rstrip() + "\n规格：" + "，".join(specs) + "。"
     return prompt
 
 
@@ -310,6 +430,7 @@ def resume(cli: Path, thread_id: str, out_dir: Path, timeout: int) -> dict:
 
 
 def generate(cli: Path, args: argparse.Namespace, out_dir: Path) -> dict:
+    ensure_account_fast(cli, force=not args.no_set_fast)
     prompt = build_prompt(args)
     tool = tool_name(args)
     attachments = list(args.attachment or [])
@@ -340,9 +461,15 @@ def generate(cli: Path, args: argparse.Namespace, out_dir: Path) -> dict:
         cmd.append("--attachments")
         cmd.extend(attachments)
     print(
-        f"提交一条视频（模型 {tool}）。高价操作会先停在确认，不会自动扣费。",
+        f"提交一条视频（模型 {tool}，mode={args.mode}，"
+        f"{'要求有声' if not args.silent else '允许无声'}）。"
+        "高价操作会先停在确认，不会自动扣费。",
         flush=True,
     )
+    if args.show_prompt:
+        print("--- 实际提交提示词 ---")
+        print(prompt)
+        print("----------------------")
     payload = run_cli(cli, cmd, heartbeat="正在生成，")
     status = payload.get("final_status")
     thread_id = str(payload.get("thread_id") or "")
@@ -390,9 +517,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="填好 Lovart AK/SK 后生成并下载一条视频。直接写 --prompt 时等价于 generate。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            "默认会：账号 set-mode --fast、Agent --mode fast、1080p、9:16、提示词强制有声、"
+            "落盘后 ffprobe 验音轨。详见 GOTCHAS.md。\n"
             "示例：\n"
             "  python3 generate_video.py check\n"
-            "  python3 generate_video.py --prompt \"雨夜街道\" --resolution 1080p --aspect 9:16 --seconds 5\n"
+            "  python3 generate_video.py --prompt \"雨夜街道\" --seconds 5\n"
+            "  python3 generate_video.py --spoken --prompt-file examples/prompt-spoken.txt\n"
             "  python3 generate_video.py confirm --thread-id 线程号\n"
             "  python3 generate_video.py resume --thread-id 线程号"
         ),
@@ -407,18 +537,59 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--model", default="seedance2.5", choices=sorted(MODELS))
     gen.add_argument("--tool", default="", help="直接指定工具名，覆盖 --model")
     gen.add_argument("--seconds", type=int, default=0, help="写入提示词的时长，0 表示不追加")
-    gen.add_argument("--resolution", default="", help="例如 1080p。空则不追加")
-    gen.add_argument("--aspect", default="", help="例如 9:16。空则不追加")
+    gen.add_argument(
+        "--resolution",
+        default=DEFAULT_RESOLUTION,
+        help=f"默认 {DEFAULT_RESOLUTION}。传空字符串可去掉",
+    )
+    gen.add_argument(
+        "--aspect",
+        default=DEFAULT_ASPECT,
+        help=f"默认 {DEFAULT_ASPECT}。传空字符串可去掉",
+    )
     gen.add_argument("--file", action="append", default=[], help="本地参考图或音频，可重复")
     gen.add_argument("--attachment", action="append", default=[], help="已经上传好的 URL，可重复")
     gen.add_argument("--project-id", default="", help="复用已有项目")
     gen.add_argument("--thread-id", default="", help="在同一对话里继续改")
-    gen.add_argument("--mode", choices=["fast", "thinking"], default="fast")
+    gen.add_argument(
+        "--mode",
+        choices=["fast", "thinking"],
+        default="fast",
+        help="Agent 推理模式，默认 fast。thinking 更慢且容易先规划出图",
+    )
+    gen.add_argument(
+        "--no-set-fast",
+        action="store_true",
+        help="不要调用账号 set-mode --fast（默认会切到 fast）",
+    )
+    gen.add_argument(
+        "--spoken",
+        action="store_true",
+        help="口播片：提示词改用「必须带口播人声音轨」",
+    )
+    gen.add_argument(
+        "--silent",
+        action="store_true",
+        help="明确要无声片：不写有声约束，也不因无音轨失败",
+    )
+    gen.add_argument(
+        "--allow-silent-output",
+        action="store_true",
+        help="仍写有声约束，但落盘无音轨时只警告、不退出失败",
+    )
+    gen.add_argument("--show-prompt", action="store_true", help="打印实际提交给 Lovart 的完整提示词")
     gen.add_argument("--yes", action="store_true", help="确认页出现后直接同意扣费")
-    gen.add_argument("--no-direct", action="store_true", help="不在提示词前加「只出视频」")
+    gen.add_argument("--no-direct", action="store_true", help="不自动加「只出视频/必须有声」前缀")
 
     chk = sub.add_parser("check", parents=[common], help="只用账号查当前生成模式，不生视频")
     chk.add_argument("--timeout", type=int, default=60)
+
+    fast = sub.add_parser("set-fast", parents=[common], help="把账号切到 fast（扣积分、不排队）")
+    unl = sub.add_parser(
+        "set-unlimited",
+        parents=[common],
+        help="把账号切到 unlimited（免费队列；本仓库生视频默认不用）",
+    )
 
     up = sub.add_parser("upload", parents=[common], help="上传本地文件，打印 CDN URL")
     up.add_argument("--file", required=True)
@@ -427,17 +598,31 @@ def build_parser() -> argparse.ArgumentParser:
     con.add_argument("--thread-id", required=True)
     con.add_argument("--out", default=str(ROOT / "output"))
     con.add_argument("--timeout", type=int, default=1200)
+    con.add_argument("--silent", action="store_true")
+    con.add_argument("--allow-silent-output", action="store_true")
 
     res = sub.add_parser("resume", parents=[common], help="超时或断线后继续等原来那一条并下载")
     res.add_argument("--thread-id", required=True)
     res.add_argument("--out", default=str(ROOT / "output"))
     res.add_argument("--timeout", type=int, default=1200)
+    res.add_argument("--silent", action="store_true")
+    res.add_argument("--allow-silent-output", action="store_true")
     return parser
 
 
 def main() -> None:
     argv = sys.argv[1:]
-    known = {"check", "upload", "confirm", "resume", "generate", "-h", "--help"}
+    known = {
+        "check",
+        "upload",
+        "confirm",
+        "resume",
+        "generate",
+        "set-fast",
+        "set-unlimited",
+        "-h",
+        "--help",
+    }
     if not argv:
         argv = ["-h"]
     elif argv[0] not in known:
@@ -454,6 +639,16 @@ def main() -> None:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
+    if args.command == "set-fast":
+        ensure_account_fast(cli, force=True)
+        return
+
+    if args.command == "set-unlimited":
+        print("账号模式：set-mode --unlimited（免费队列）", flush=True)
+        payload = run_cli(cli, ["set-mode", "--unlimited"])
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
     if args.command == "upload":
         urls = upload_files(cli, [args.file])
         print(json.dumps({"url": urls[0]}, ensure_ascii=False))
@@ -461,6 +656,8 @@ def main() -> None:
 
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    require_audio = not getattr(args, "silent", False)
+    allow_silent = bool(getattr(args, "allow_silent_output", False) or getattr(args, "silent", False))
 
     if args.command == "confirm":
         payload = confirm(cli, args.thread_id, out_dir, args.timeout)
@@ -468,18 +665,23 @@ def main() -> None:
             payload = resume(cli, args.thread_id, out_dir, args.timeout)
         if payload.get("final_status") == "pending_confirmation":
             payload = stop_or_confirm(cli, payload, out_dir, False, args.timeout)
-        report(payload, out_dir)
+        report(payload, out_dir, require_audio=require_audio, allow_silent=allow_silent)
         return
 
     if args.command == "resume":
         payload = resume(cli, args.thread_id, out_dir, args.timeout)
         if payload.get("final_status") == "pending_confirmation":
             payload = stop_or_confirm(cli, payload, out_dir, False, args.timeout)
-        report(payload, out_dir)
+        report(payload, out_dir, require_audio=require_audio, allow_silent=allow_silent)
         return
 
     payload = generate(cli, args, out_dir)
-    report(payload, out_dir)
+    report(
+        payload,
+        out_dir,
+        require_audio=not args.silent,
+        allow_silent=args.allow_silent_output or args.silent,
+    )
 
 
 if __name__ == "__main__":
